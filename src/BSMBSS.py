@@ -49,13 +49,21 @@ class OnlineBSM:
     fit_batch(X_batch)     -- Updates the network parameters for given batch data X_batch (but in online manner)
     
     """
-    def __init__(self, s_dim, x_dim, gamma = 0.9999, mu = 1e-3, beta = 1e-7, W = None, M = None, D = None, neural_OUTPUT_COMP_TOL = 1e-6, set_ground_truth = False, S = None, A = None):
+    def __init__(self, s_dim, x_dim, gamma = 0.9999, mu = 1e-3, beta = 1e-7, W = None, M = None, D = None, whiten_input_ = True, neural_OUTPUT_COMP_TOL = 1e-6, set_ground_truth = False, S = None, A = None):
         if W is not None:
-            assert W.shape == (s_dim, x_dim), "The shape of the initial guess W must be (s_dim,x_dim)=(%d,%d)" % (s_dim, x_dim)
-            W = W
+            if whiten_input_:
+                assert W.shape == (s_dim, s_dim), "The shape of the initial guess W must be (s_dim,s_dim)=(%d,%d) (because of whitening)" % (s_dim, x_dim)
+                W = W
+            else:
+                assert W.shape == (s_dim, x_dim), "The shape of the initial guess W must be (s_dim,x_dim)=(%d,%d)" % (s_dim, x_dim)
+                W = W
         else:
-            W = np.random.randn(s_dim,x_dim)
-            W = 0.0033 * (W / np.sqrt(np.sum(np.abs(W)**2,axis = 1)).reshape(s_dim,1))
+            if whiten_input_:
+                W = np.random.randn(s_dim,s_dim)
+                W = 0.0033 * (W / np.sqrt(np.sum(np.abs(W)**2,axis = 1)).reshape(s_dim,1))
+            else:
+                W = np.random.randn(s_dim,x_dim)
+                W = 0.0033 * (W / np.sqrt(np.sum(np.abs(W)**2,axis = 1)).reshape(s_dim,1))
             # for k in range(W_HX.shape[0]):
             #     W_HX[k,:] = WScalings[0] * W_HX[k,:]/np.linalg.norm(W_HX[k,:])
             
@@ -79,44 +87,34 @@ class OnlineBSM:
         self.W = W
         self.M = M
         self.D = D
+        self.whiten_input_ = whiten_input_
         self.neural_OUTPUT_COMP_TOL = neural_OUTPUT_COMP_TOL
         self.set_ground_truth = set_ground_truth
         self.S = S
         self.A = A
         self.SIRlist = []
         
-    def whiten_signal(self, X, mean_normalize = True, type_ = 2):
-        """
-        Input : X  ---> Input signal to be whitened
-
-        type_ : Defines the type for preprocesing matrix. type_ = 1 and 2 uses eigenvalue decomposition whereas type_ = 3 uses SVD.
-
-        Output: X_white  ---> Whitened signal, i.e., X_white = W_pre @ X where W_pre = (R_x^0.5)^+ (square root of sample correlation matrix)
-        """
-        if mean_normalize:
-            X = X - np.mean(X,axis = 0, keepdims = True)
-
-        cov = np.cov(X.T)
-
-        if type_ == 3: # Whitening using singular value decomposition
-            U,S,V = np.linalg.svd(cov)
-            d = np.diag(1.0 / np.sqrt(S))
-            W_pre = np.dot(U, np.dot(d, U.T))
-
-        else: # Whitening using eigenvalue decomposition
-            d,S = np.linalg.eigh(cov)
-            D = np.diag(d)
-
-            D_sqrt = np.sqrt(D * (D>0))
-
-            if type_ == 1: # Type defines how you want W_pre matrix to be
-                W_pre = np.linalg.pinv(S@D_sqrt)
-            elif type_ == 2:
-                W_pre = np.linalg.pinv(S@D_sqrt@S.T)
-
-        X_white = (W_pre @ X.T).T
-
-        return X_white, W_pre
+    def whiten_input(self, X):
+        x_dim = self.x_dim
+        s_dim = self.s_dim
+        N = X.shape[1]
+        # Mean of the mixtures
+        mX = np.mean(X, axis = 1).reshape((x_dim, 1))
+        # Covariance of Mixtures
+        Rxx = np.dot(X, X.T)/N - np.dot(mX, mX.T)
+        # Eigenvalue Decomposition
+        d, V = np.linalg.eig(Rxx)
+        D = np.diag(d)
+        # Sorting indexis for eigenvalues from large to small
+        ie = np.argsort(-d)
+        # Inverse square root of eigenvalues
+        ddinv = 1/np.sqrt(d[ie[:s_dim]])
+        # Pre-whitening matrix
+        Wpre = np.dot(np.diag(ddinv), V[:, ie[:s_dim]].T)#*np.sqrt(12)
+        # Whitened mixtures
+        H = np.dot(Wpre, X)
+        self.Wpre = Wpre
+        return H, Wpre
 
     # Calculate SIR Function
     def CalculateSIR(self, H,pH, return_db = True):
@@ -154,7 +152,7 @@ class OnlineBSM:
 
     @staticmethod
     @njit
-    def run_neural_dynamics_antisparse(x, y, W, M, D,neural_dynamic_iterations = 250, lr_start = 0.1, lr_stop = 1e-3, tol = 1e-6, fast_start = False):
+    def run_neural_dynamics_antisparse(x, y, W, M, D,neural_dynamic_iterations = 250, lr_start = 0.1, lr_stop = 1e-15, tol = 1e-6, fast_start = False):
 
         def ProjectOntoLInfty(X, thresh = 1.0):
             return X*(X>=-thresh)*(X<=thresh)+(X>thresh)*thresh-thresh*(X<-thresh)
@@ -171,7 +169,8 @@ class OnlineBSM:
             lr = max(lr_start/(1 + j), lr_stop)
             yold = y
             du = -u + (W @ x - M_hat @ D @ y)
-            u = u - lr * du
+            # u = u - lr * du
+            y = y - lr * du
 
             y = ProjectOntoLInfty(u / np.diag(Upsilon * D))
 
@@ -204,11 +203,12 @@ class OnlineBSM:
         self.D = D
         
         
-    def fit_batch_antisparse(self, X, n_epochs = 1, whiten = False, shuffle = False, neural_dynamic_iterations = 250, neural_lr_start = 0.3, neural_lr_stop = 1e-3, fast_start = False, debug_iteration_point = 1000, plot_in_jupyter = False):
+    def fit_batch_antisparse(self, X, n_epochs = 1, shuffle = False, neural_dynamic_iterations = 250, neural_lr_start = 0.3, neural_lr_stop = 1e-3, fast_start = False, debug_iteration_point = 1000, plot_in_jupyter = False):
         gamma, mu, beta, W, M, D = self.gamma, self.mu, self.beta, self.W, self.M, self.D
         neural_OUTPUT_COMP_TOL = self.neural_OUTPUT_COMP_TOL
         debugging = self.set_ground_truth
         SIRlist = self.SIRlist
+        whiten = self.whiten_input_
 
         if debugging:
             S = self.S
@@ -217,8 +217,7 @@ class OnlineBSM:
         assert X.shape[0] == self.x_dim, "You must input the transpose"
         
         samples = X.shape[1]
-        
-        Y = np.zeros((self.s_dim, samples))
+
         Y = 0.05*np.random.randn(self.s_dim, samples)
         
         if shuffle:
@@ -227,8 +226,7 @@ class OnlineBSM:
             idx = np.arange(samples)
             
         if whiten:
-            X_white, W_pre = self.whiten_signal(X.T)
-            X_white = X_white.T
+            X_white, W_pre = self.whiten_input(X)
             A = W_pre @ A
             self.A = A
         else:
@@ -312,6 +310,37 @@ def whiten_signal(X, mean_normalize = True, type_ = 3):
     X_white = (W_pre @ X.T).T
     
     return X_white, W_pre
+
+def whiten_input(X, n_components = None, return_prewhitening_matrix = False):
+    """
+    X.shape[0] = Number of sources
+    X.shape[1] = Number of samples for each signal
+    """
+    x_dim = X.shape[0]
+    if n_components is None:
+        n_components = x_dim
+    s_dim = n_components
+    
+    N = X.shape[1]
+    # Mean of the mixtures
+    mX = np.mean(X, axis = 1).reshape((x_dim, 1))
+    # Covariance of Mixtures
+    Rxx = np.dot(X, X.T)/N - np.dot(mX, mX.T)
+    # Eigenvalue Decomposition
+    d, V = np.linalg.eig(Rxx)
+    D = np.diag(d)
+    # Sorting indexis for eigenvalues from large to small
+    ie = np.argsort(-d)
+    # Inverse square root of eigenvalues
+    ddinv = 1/np.sqrt(d[ie[:s_dim]])
+    # Pre-whitening matrix
+    Wpre = np.dot(np.diag(ddinv), V[:, ie[:s_dim]].T)#*np.sqrt(12)
+    # Whitened mixtures
+    H = np.dot(Wpre, X)
+    if return_prewhitening_matrix:
+        return H, Wpre
+    else:
+        return H
 
 def ZeroOneNormalizeData(data):
     return (data - np.min(data)) / (np.max(data) - np.min(data))
