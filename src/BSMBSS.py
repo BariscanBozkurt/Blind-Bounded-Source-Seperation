@@ -44,9 +44,9 @@ class OnlineBSM:
     
     ProjectOntoLInfty(X)   -- Project the given vector X onto L_infinity norm ball
     
-    fit_next(x_online)     -- Updates the network parameters for one data point x_online
+    fit_next_antisparse(x_online)     -- Updates the network parameters for one data point x_online
     
-    fit_batch(X_batch)     -- Updates the network parameters for given batch data X_batch (but in online manner)
+    fit_batch_antisparse(X_batch)     -- Updates the network parameters for given batch data X_batch (but in online manner)
     
     """
     def __init__(self, s_dim, x_dim, gamma = 0.9999, mu = 1e-3, beta = 1e-7, W = None, M = None, D = None, whiten_input_ = True, neural_OUTPUT_COMP_TOL = 1e-6, set_ground_truth = False, S = None, A = None):
